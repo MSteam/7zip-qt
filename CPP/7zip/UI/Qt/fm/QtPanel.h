@@ -155,6 +155,12 @@ public:
 
   QtFolderModel *model() const { return _model; }
 
+  // Open the FS item named `name` in this (FS) panel as if double-clicked: an
+  // archive opens as a folder, anything else opens with its associated program.
+  // Used to honor a file passed on the command line (a file-manager "Open with" /
+  // MIME association). Returns false if not on an FS folder or the name is absent.
+  bool openFsItemByName(const UString &name);
+
   // G.4b : the visible-columns set keyed by column PROPID, the seam the NEXT task
   // (persistence) saves/restores. visibleColumnPropIDs() returns every column's
   // (PROPID, visible) state in column order (kpidName first); setColumnVisible()

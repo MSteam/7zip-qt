@@ -1715,6 +1715,20 @@ void QtPanel::onDoubleClicked(const QModelIndex &proxyIndex)
   }
 }
 
+bool QtPanel::openFsItemByName(const UString &name)
+{
+  // Honor a file passed on the command line (file-association / "Open with"): find
+  // its row in the current FS folder and run the same activation a double-click does
+  // (onLeafActivated -> try-as-archive, else open with the associated program).
+  if (_inArchive || name.IsEmpty())
+    return false;
+  const int row = _model->rowForName(name);
+  if (row < 0)
+    return false;
+  onLeafActivated(row);
+  return true;
+}
+
 void QtPanel::onLeafActivated(int row)
 {
   // CPanel::OpenItem / OpenItemInArchive (PanelItemOpen.cpp:950 / :1461): a folder is

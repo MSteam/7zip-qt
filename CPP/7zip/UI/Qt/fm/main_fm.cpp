@@ -3931,11 +3931,48 @@ int main(int argc, char **argv)
   if (op != ScriptOp::None)
     return RunScriptedOp(leftU, rightU, op, hashMethod, opArg);
 
+  // If the positional argument is an existing FILE (not a directory) — e.g. an
+  // archive opened through a desktop file-association or a file manager's "Open
+  // with" — start the LEFT panel in the file's PARENT directory and open the file
+  // once the event loop is running (an archive opens as a folder; anything else
+  // opens with its associated program). A directory argument keeps the old behavior.
+  UString leftStart = leftRaw;
+  UString startupItem;
+  if (!leftRaw.IsEmpty())
+  {
+    NFile::NFind::CFileInfo fi;
+    if (fi.Find(us2fs(leftRaw)) && !fi.IsDir())
+    {
+      const int slash = leftRaw.ReverseFind_PathSepar();
+      if (slash >= 0)
+      {
+        leftStart   = leftRaw.Left((unsigned)(slash + 1)); // parent dir (keeps the separator)
+        startupItem = leftRaw.Ptr((unsigned)(slash + 1));  // leaf name
+      }
+      else
+      {
+        leftStart   = cwdU;       // bare name -> current directory
+        startupItem = leftRaw;
+      }
+    }
+  }
+
   // G.4a : pass the RAW dirs so an absent positional arg lets the window restore
   // the persisted per-panel last path (ReadPanelPath), falling back to cwd only
   // when nothing was stored. An explicit dir filled leftRaw/rightRaw and overrides.
-  QtFileManagerWindow window(leftRaw, rightRaw, /*headless*/ false);
+  QtFileManagerWindow window(leftStart, rightRaw, /*headless*/ false);
   window.show();
+
+  // Deferred so the panel is fully shown (and the open's progress dialog / password
+  // prompt parents correctly) before the archive open runs.
+  if (!startupItem.IsEmpty())
+  {
+    const UString item = startupItem;
+    QTimer::singleShot(0, &window, [&window, item]() {
+      if (window.leftPanel())
+        window.leftPanel()->openFsItemByName(item);
+    });
+  }
 
   // Self-grab screenshot path: show the window, let it paint, grab it to a PNG,
   // then quit. Used to capture the real Wayland/X rendering of the two-panel
