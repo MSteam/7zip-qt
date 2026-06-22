@@ -63,6 +63,7 @@
 #include <QtCore/QStandardPaths>  // B.8 : XDG data dir for the trash location
 #include <QtGui/QImage>
 #include <QtGui/QPixmap>
+#include <QtGui/QIcon>            // icon-theme fallback (self-contained / AppImage runs)
 #include <QtGui/QPalette>         // P.3 : --dark forced-Fusion dark QPalette
 #include <QtGui/QColor>
 
@@ -3657,6 +3658,29 @@ int main(int argc, char **argv)
     qputenv("QT_QPA_PLATFORM", "offscreen");
 
   QApplication app(argc, argv);
+
+  // Icon-theme fallback. The per-type file icons come from QIcon::fromTheme(), which
+  // needs a current icon-theme NAME. On a normal desktop the platform-theme plugin
+  // supplies it from the user's settings, but a self-contained build (AppImage) may
+  // run WITHOUT that plugin, leaving QIcon::themeName() empty -> fromTheme() resolves
+  // nothing and files show no icons. When no theme is active, pick the first installed
+  // theme that actually provides icons (the theme FILES are still found on the system
+  // via the XDG icon dirs). A non-empty themeName (the usual case) is left untouched.
+  if (QIcon::themeName().isEmpty())
+  {
+    static const char * const kThemeCandidates[] = {
+      "breeze", "Adwaita", "oxygen", "gnome", "elementary", "Papirus",
+      "Mint-Y", "Yaru", "hicolor" };
+    for (const char *t : kThemeCandidates)
+    {
+      QIcon::setThemeName(QString::fromLatin1(t));
+      if (!QIcon::fromTheme(QStringLiteral("text-x-generic")).isNull())
+        break;
+    }
+  }
+  // A fallback theme covers individual icons the active theme happens to lack.
+  if (QIcon::fallbackThemeName().isEmpty())
+    QIcon::setFallbackThemeName(QStringLiteral("hicolor"));
 
   // P.2 : load the active translation BEFORE any window/menu is built so every
   // FmLang(id, english) resolves through the loaded CLang.
