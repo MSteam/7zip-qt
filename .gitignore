@@ -1,0 +1,11 @@
+# CMake / Ninja build output
+/build/
+
+# Object-file build directories (e.g. CPP/7zip/Bundles/Alone2/_o)
+**/_o/
+*.o
+*.obj
+
+# Editor / OS cruft
+*.swp
+.DS_Store

@@ -12,6 +12,12 @@
 #include "../../../Windows/ErrorMsg.h"
 #include "../../../Windows/FileDir.h"
 #include "../../../Windows/FileName.h"
+#ifndef _WIN32
+// [B.4 Linux port] for NTime::FiTime_To_FILETIME (CFiTime -> FILETIME). On Linux
+// CFileInfo::MTime is a CFiTime (timespec), not a FILETIME; AskWrite() takes a
+// FILETIME*, so we convert. On Windows CFiTime IS FILETIME (no include needed).
+#include "../../../Windows/TimeUtils.h"
+#endif
 
 #include "../../Common/FilePathAutoRename.h"
 
@@ -59,6 +65,7 @@ HRESULT CCopyStateIO::MyCopyFile(CFSTR inPath, CFSTR outPath, DWORD attrib)
     
     for (;;)
     {
+#ifdef _WIN32
       UInt32 num;
       if (!inFile.Read(buf, kBufSize, num))
       {
@@ -67,7 +74,7 @@ HRESULT CCopyStateIO::MyCopyFile(CFSTR inPath, CFSTR outPath, DWORD attrib)
       }
       if (num == 0)
         break;
-      
+
       UInt32 written = 0;
       if (!outFile.Write(buf, num, written))
       {
@@ -79,7 +86,29 @@ HRESULT CCopyStateIO::MyCopyFile(CFSTR inPath, CFSTR outPath, DWORD attrib)
         ErrorMessage = "Write error";
         return S_OK;
       }
-      CurrentSize += num;
+#else
+      // [B.4 Linux port] CInFile::Read(buf,size,&num)/COutFile::Write(buf,size,
+      // &written) are the Win32 overloads. The Linux CInFile/COutFile expose
+      // read_part()/write_full()/WriteFull() instead (FileIO.h POSIX branch),
+      // which is exactly what the engine's own portable copy (FileDir.cpp
+      // My_CopyFile) uses. Same loop semantics: read a partial chunk, stop at EOF
+      // (read_part()==0), write it FULLY.
+      const ssize_t num = inFile.read_part(buf, kBufSize);
+      if (num < 0)
+      {
+        ErrorFileIndex = 0;
+        return S_OK;
+      }
+      if (num == 0)
+        break;
+
+      if (!outFile.WriteFull(buf, (size_t)num))
+      {
+        ErrorFileIndex = 1;
+        return S_OK;
+      }
+#endif
+      CurrentSize += (UInt64)num;
       if (Progress)
       {
         UInt64 completed = StartPos + CurrentSize;
@@ -91,9 +120,24 @@ HRESULT CCopyStateIO::MyCopyFile(CFSTR inPath, CFSTR outPath, DWORD attrib)
   /* SetFileAttrib("path:alt_stream_name") sets attributes for main file "path".
      But we don't want to change attributes of main file, when we write alt stream.
      So we need INVALID_FILE_ATTRIBUTES for alt stream here */
-  
+
+#ifdef _WIN32
   if (attrib != INVALID_FILE_ATTRIBUTES)
     SetFileAttrib(outPath, attrib);
+#else
+  // [B.4 Linux port] NDir::SetFileAttrib(CFSTR, DWORD) is declared/defined only
+  // under `#ifdef _WIN32` in Windows/FileDir.{h,cpp}: Windows file attributes are
+  // a Win32 concept. The portable equivalent that DOES build on Linux is
+  // NDir::SetFileAttrib_PosixHighDetect (it extracts only the posix-relevant bits
+  // from a Windows-attrib field). But the `attrib` passed here is the source's
+  // GetWinAttrib()-mapped value (the B.2 mapping in FSFolder.cpp), which carries
+  // NO posix mode bits, so applying it would be meaningless/harmful. So on Linux
+  // the copied file simply keeps the mode COutFile::Create_ALWAYS gave it (0666 &
+  // umask), exactly as the engine's own portable copy (FileDir.cpp My_CopyFile)
+  // does — it likewise sets no attributes on the destination. Preserving full
+  // posix permissions/ownership on copy is deferred (it needs the src stat()).
+  UNUSED_VAR(attrib)
+#endif
 
   if (DeleteSrcFile)
   {
@@ -103,9 +147,68 @@ HRESULT CCopyStateIO::MyCopyFile(CFSTR inPath, CFSTR outPath, DWORD attrib)
       return S_OK;
     }
   }
-  
+
   return S_OK;
 }
+
+
+#ifndef _WIN32
+// [B.4 Linux port] POSIX equivalent of NDir::RemoveDirWithSubItems (which is
+// _WIN32-only in Windows/FileDir.cpp). Faithful mirror of that function's logic:
+// enumerate the directory, recurse into sub-directories, unlink files, then
+// rmdir the (now empty) directory. The Win32 original uses the single-arg
+// CEnumerator::Next(fi) and a SetFileAttrib(path,0) read-only clear before
+// RemoveDir; on Linux the enumerator is the two-phase readdir wrapper
+// (Next(de,found)+Fill_FileInfo, as in the B.2 FSFolder.cpp ports) and there is
+// no read-only attribute to clear, so RemoveDir (rmdir) is called directly.
+bool RemoveDirWithSubItems_Fs(const FString &path)
+{
+  {
+    NFind::CFileInfo fi;
+    if (!fi.Find(path))
+      return false;
+    if (!fi.IsDir())
+      return false;
+  }
+
+  {
+    FString s (path);
+    s.Add_PathSepar();
+    const unsigned prefixSize = s.Len();
+    NFind::CEnumerator enumerator;
+    enumerator.SetDirPrefix(s);
+    for (;;)
+    {
+      NFind::CDirEntry de;
+      bool found;
+      if (!enumerator.Next(de, found))
+        return false;
+      if (!found)
+        break;
+      s.DeleteFrom(prefixSize);
+      s += de.Name;
+      bool isDir;
+      {
+        NFind::CFileInfo fi2;
+        // followLink=false: like the Win32 original, do not descend through a
+        // symlink-to-directory; unlink the link itself.
+        if (!enumerator.Fill_FileInfo(de, fi2, false))
+          return false;
+        isDir = fi2.IsDir();
+      }
+      if (isDir)
+      {
+        if (!RemoveDirWithSubItems_Fs(s))
+          return false;
+      }
+      else if (!DeleteFileAlways(s))
+        return false;
+    }
+  }
+
+  return RemoveDir(path);
+}
+#endif
 
 
 /*
@@ -130,6 +233,19 @@ struct CProgressInfo
 
   void Init() { ProgressResult = S_OK; }
 };
+
+// [B.4 Linux port] The Win32 CopyFileEx/MoveFileWithProgress fast path below
+// (its progress-callback type LPPROGRESS_ROUTINE, the CopyProgressRoutine that
+// adapts it to IProgress, the dynamic kernel32 CopyFileExW/MoveFileWithProgressW
+// lookup, and CCopyState::CopyFile_NT/CopyFile_Sys/MoveFile_Sys) is the WINDOWS
+// optimization that lets the OS copy/move the bytes. On Linux there is no such
+// API; the engine's own portable byte-copy (CCopyStateIO::MyCopyFile, above) is
+// the cross-platform fallback. So this whole block is `#ifdef _WIN32` (Windows
+// branch VERBATIM-original) and CopyTo() forces UseReadWriteMode=true on Linux so
+// the read/write byte-copy path is always taken; CCopyState::MoveFile_Sys keeps a
+// Linux body (NDir::MyMoveFile) since CopyFolder() calls it directly for the
+// same-volume directory-rename move shortcut.
+#ifdef _WIN32
 
 #ifndef PROGRESS_CONTINUE
 
@@ -219,6 +335,8 @@ typedef BOOL (WINAPI * Func_MoveFileWithProgressW)(
     );
 #endif
 
+#endif // _WIN32  [B.4 Linux port] end of the Win32 CopyFileEx/MoveFileWithProgress fast-path types
+
 struct CCopyState
 {
   CProgressInfo ProgressInfo;
@@ -240,8 +358,12 @@ public:
   CCopyState();
 #endif
 
+#ifdef _WIN32
   bool CopyFile_NT(const wchar_t *oldFile, const wchar_t *newFile);
   bool CopyFile_Sys(CFSTR oldFile, CFSTR newFile);
+#endif
+  // [B.4 Linux port] MoveFile_Sys is still declared/defined on Linux: CopyFolder()
+  // calls it directly for the same-volume directory-rename move shortcut.
   bool MoveFile_Sys(CFSTR oldFile, CFSTR newFile);
 
   HRESULT CallProgress();
@@ -298,6 +420,12 @@ CCopyState::CCopyState()
     OK                       - there are NO alt streams in fromFile
     ERROR_INVALID_PARAMETER  - there are    alt streams in fromFile
 */
+
+// [B.4 Linux port] CopyFile_NT / CopyFile_Sys wrap the Win32 CopyFileEx[A/W]
+// system file-copy. They are NEVER reached on Linux (CopyTo() forces
+// UseReadWriteMode=true => CopyFile_Ask takes the CCopyStateIO byte-copy branch,
+// never CopyFile_Sys). Guard the bodies out; the Windows branch is VERBATIM.
+#ifdef _WIN32
 
 bool CCopyState::CopyFile_NT(const wchar_t *oldFile, const wchar_t *newFile)
 {
@@ -366,8 +494,18 @@ bool CCopyState::CopyFile_Sys(CFSTR oldFile, CFSTR newFile)
   }
 }
 
+#endif // _WIN32  [B.4 Linux port] end of Win32 CopyFile_NT / CopyFile_Sys
+
 bool CCopyState::MoveFile_Sys(CFSTR oldFile, CFSTR newFile)
 {
+#ifndef _WIN32
+  // [B.4 Linux port] No MoveFileWithProgressW on Linux. The engine's portable
+  // move is NDir::MyMoveFile (Windows/FileDir.cpp POSIX branch): rename(), with a
+  // copy+unlink fallback across filesystems (MyMoveFile_with_Progress). This is
+  // exactly the cross-platform `MoveFile_Sys` tail the Windows branch falls back
+  // to when the dynamic MoveFileWithProgressW is unavailable.
+  return MyMoveFile(oldFile, newFile);
+#else
   #ifndef UNDER_CE
   // if (IsItWindows2000orHigher())
   // {
@@ -413,6 +551,7 @@ bool CCopyState::MoveFile_Sys(CFSTR oldFile, CFSTR newFile)
   // else
   #endif
     return MyMoveFile(oldFile, newFile);
+#endif // _WIN32  [B.4 Linux port] end Win32 MoveFile_Sys body
 }
 
 static HRESULT SendMessageError(IFolderOperationsExtractCallback *callback,
@@ -466,10 +605,20 @@ static HRESULT CopyFile_Ask(
 
   Int32 writeAskResult;
   CMyComBSTR destPathResult;
+#ifdef _WIN32
+  const FILETIME *srcMTimePtr = &srcFileInfo.MTime;
+#else
+  // [B.4 Linux port] convert CFiTime (timespec) -> FILETIME for the AskWrite ABI.
+  // FiTime_To_FILETIME is declared at GLOBAL scope on Linux (TimeUtils.h:56,
+  // before the NWindows::NTime namespace), so it is called unqualified.
+  FILETIME srcMTime_ft;
+  FiTime_To_FILETIME(srcFileInfo.MTime, srcMTime_ft);
+  const FILETIME *srcMTimePtr = &srcMTime_ft;
+#endif
   RINOK(state.Callback->AskWrite(
       fs2us(srcPath),
       BoolToInt(false),
-      &srcFileInfo.MTime, &srcFileInfo.Size,
+      srcMTimePtr, &srcFileInfo.Size,
       fs2us(destPath),
       &destPathResult,
       &writeAskResult))
@@ -488,8 +637,19 @@ static HRESULT CopyFile_Ask(
       state2.StartPos = state.ProgressInfo.StartPos;
 
       RINOK(state2.MyCopyFile(srcPath, destPathNew,
-          state.IsAltStreamsDest ? INVALID_FILE_ATTRIBUTES: srcFileInfo.Attrib))
-      
+          state.IsAltStreamsDest ? INVALID_FILE_ATTRIBUTES :
+#ifdef _WIN32
+          srcFileInfo.Attrib
+#else
+          // [B.4 Linux port] CFileInfoBase::Attrib is _WIN32-only (B.2). The
+          // GetWinAttrib()-mapped value carries no posix mode bits, and
+          // MyCopyFile's SetFileAttrib is a no-op on Linux anyway, so pass
+          // INVALID_FILE_ATTRIBUTES (== "don't set attributes"), matching the
+          // engine's own portable My_CopyFile which sets none.
+          INVALID_FILE_ATTRIBUTES
+#endif
+          ))
+
       if (state2.ErrorFileIndex >= 0)
       {
         if (state2.ErrorMessage.IsEmpty())
@@ -504,6 +664,11 @@ static HRESULT CopyFile_Ask(
       }
       state.ProgressInfo.StartPos += state2.CurrentSize;
     }
+#ifdef _WIN32
+    // [B.4 Linux port] The system-copy branch (CopyFile_Sys/MoveFile_Sys via the
+    // Win32 CopyFileEx/MoveFileWithProgress) is UNREACHABLE on Linux because
+    // UseReadWriteMode is forced true above, and those functions are Win32-only.
+    // Guard it out (Windows branch VERBATIM) so it does not need to compile.
     else
     {
       state.ProgressInfo.FileSize = srcFileInfo.Size;
@@ -535,6 +700,7 @@ static HRESULT CopyFile_Ask(
       }
       state.ProgressInfo.StartPos += state.ProgressInfo.FileSize;
     }
+#endif // _WIN32
   }
   else
   {
@@ -598,9 +764,10 @@ static HRESULT CopyFolder(
 
   CEnumerator enumerator;
   enumerator.SetDirPrefix(CombinePath(srcPath, FString()));
-  
+
   for (;;)
   {
+#ifdef _WIN32
     NFind::CFileInfo fi;
     bool found;
     if (!enumerator.Next(fi, found))
@@ -610,6 +777,34 @@ static HRESULT CopyFolder(
     }
     if (!found)
       break;
+#else
+    // [B.4 Linux port] The Win32 CEnumerator::Next(CFileInfo&, bool&) yields a
+    // full CFileInfo directly. The Linux CEnumerator is a readdir() wrapper:
+    // Next(CDirEntry&, bool&) yields only {name, d_type}; the full CFileInfo
+    // (size, IsDir, MTime — needed by CopyFile_Ask) is resolved per-entry via
+    // Fill_FileInfo() (lstat). This is the SAME two-phase pattern the B.2 port of
+    // CFsFolderStat::Enumerate (FSFolder.cpp) and the engine's own
+    // CDirItems::EnumerateOneDir use. Windows branch (#if) is verbatim-original.
+    NFind::CFileInfo fi;
+    bool found;
+    {
+      NFind::CDirEntry de;
+      if (!enumerator.Next(de, found))
+      {
+        SendLastErrorMessage(state.Callback, srcPath);
+        return S_OK;
+      }
+      if (!found)
+        break;
+      // followLink=true: copy the real (linked) file's bytes/size, matching the
+      // Win32 CopyFileEx behaviour for the items a folder listing presents.
+      if (!enumerator.Fill_FileInfo(de, fi, true))
+      {
+        SendLastErrorMessage(state.Callback, CombinePath(srcPath, de.Name));
+        return S_OK;
+      }
+    }
+#endif
     const FString srcPath2 = CombinePath(srcPath, fi.Name);
     const FString destPath2 = CombinePath(destPath, fi.Name);
     if (fi.IsDir())
@@ -645,7 +840,14 @@ Z7_COM7F_IMF(CFSFolder::CopyTo(Int32 moveMode, const UInt32 *indices, UInt32 num
   if (destPath.IsEmpty())
     return E_INVALIDARG;
 
+#ifdef _WIN32
   const bool isAltDest = NName::IsAltPathPrefix(destPath);
+#else
+  // [B.4 Linux port] NName::IsAltPathPrefix is _WIN32-only (FileName.cpp builds it
+  // inside #ifdef _WIN32 — it is an NTFS alternate-data-stream "path:" probe).
+  // Linux has no alt streams, so the destination is never an alt-stream dest.
+  const bool isAltDest = false;
+#endif
   const bool isDirectPath = (!isAltDest && !IsPathSepar(destPath.Back()));
 
   if (isDirectPath)
@@ -707,7 +909,14 @@ Z7_COM7F_IMF(CFSFolder::CopyTo(Int32 moveMode, const UInt32 *indices, UInt32 num
   /* CopyFileW(fromFile, toFile:altStream) returns ERROR_INVALID_PARAMETER,
        if there are alt streams in fromFile.
      So we don't use CopyFileW() for alt Streams. */
+#ifdef _WIN32
   state.UseReadWriteMode = isAltDest;
+#else
+  // [B.4 Linux port] There is no Win32 CopyFileEx on Linux; the only copy path
+  // that builds is the portable byte-copy (CCopyStateIO::MyCopyFile). Force the
+  // read/write mode ALWAYS so CopyFile_Ask takes that branch (never CopyFile_Sys).
+  state.UseReadWriteMode = true;
+#endif
 
   for (i = 0; i < numItems; i++)
   {
@@ -756,7 +965,12 @@ HRESULT CopyFileSystemItems(
   if (destDirPrefix.IsEmpty())
     return E_INVALIDARG;
 
+#ifdef _WIN32
   const bool isAltDest = NName::IsAltPathPrefix(destDirPrefix);
+#else
+  // [B.4 Linux port] see CopyTo(): IsAltPathPrefix is _WIN32-only; no alt streams.
+  const bool isAltDest = false;
+#endif
 
   CFsFolderStat stat;
   stat.Progress = callback;
@@ -807,7 +1021,12 @@ HRESULT CopyFileSystemItems(
   /* CopyFileW(fromFile, toFile:altStream) returns ERROR_INVALID_PARAMETER,
        if there are alt streams in fromFile.
      So we don't use CopyFileW() for alt Streams. */
+#ifdef _WIN32
   state.UseReadWriteMode = isAltDest;
+#else
+  // [B.4 Linux port] see CopyTo(): force the portable byte-copy path on Linux.
+  state.UseReadWriteMode = true;
+#endif
 
   FOR_VECTOR (i, itemsPaths)
   {

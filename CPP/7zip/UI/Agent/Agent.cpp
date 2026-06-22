@@ -1497,7 +1497,13 @@ Z7_COM7F_IMF(CAgentFolder::Extract(const UInt32 *indices,
   {
     pathU = us2fs(path);
     if (!pathU.IsEmpty()
-      && !NFile::NName::IsAltStreamPrefixWithColon(path))
+     #ifdef _WIN32
+      // IsAltStreamPrefixWithColon (Windows/FileName.*) is a _WIN32-only helper
+      // (NTFS "path:stream" detection); on Linux there are no alt-stream colon
+      // prefixes, so the directory is always created. [B.0 Linux port]
+      && !NFile::NName::IsAltStreamPrefixWithColon(path)
+     #endif
+      )
     {
       NFile::NName::NormalizeDirPathPrefix(pathU);
       NFile::NDir::CreateComplexDir(pathU);
@@ -1620,8 +1626,18 @@ Z7_COM7F_IMF(CAgent::Open(
       return GetLastError_noZero_HRESULT();
     if (fi.IsDir())
       return E_FAIL;
+   #ifdef _WIN32
     _attrib = fi.Attrib;
     _isDeviceFile = fi.IsDevice;
+   #else
+    // [B.0 Linux port] CFileInfoBase has no Attrib/IsDevice members on Linux
+    // (they are _WIN32-only, see Windows/FileFind.h). Use the portable POSIX
+    // accessors: GetWinAttrib() maps the POSIX mode to a Windows attribute
+    // bitmask (what _attrib / Is_Attrib_ReadOnly expects), and a "device file"
+    // is a character/block special file.
+    _attrib = fi.GetWinAttrib();
+    _isDeviceFile = S_ISCHR(fi.mode) || S_ISBLK(fi.mode);
+   #endif
     FString dirPrefix, fileName;
     if (NFile::NDir::GetFullPathAndSplit(us2fs(_archiveFilePath), dirPrefix, fileName))
     {
@@ -1667,7 +1683,9 @@ Z7_COM7F_IMF(CAgent::Open(
     if (!inStream)
     {
       arc.MTime.Set_From_FiTime(fi.MTime);
-      arc.MTime.Def = !fi.IsDevice;
+      // [B.0 Linux port] reuse _isDeviceFile (set above from fi) instead of the
+      // _WIN32-only fi.IsDevice member; identical value on Windows.
+      arc.MTime.Def = !_isDeviceFile;
     }
     
     ArchiveType = GetTypeOfArc(arc);

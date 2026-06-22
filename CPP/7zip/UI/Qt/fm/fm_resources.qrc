@@ -1,0 +1,79 @@
+<!--
+  fm_resources.qrc  (milestone B.3)
+
+  Embeds the ORIGINAL 7-Zip File Manager image assets BY THEIR IN-TREE PATHS
+  (relative to this .qrc file, which lives in CPP/7zip/UI/Qt/fm/). NOTHING is
+  copied or recreated: the file paths point straight at the stock
+  CPP/7zip/UI/FileManager/*.bmp + *.ico that resource.rc itself references:
+
+     IDI_ICON  ICON  "FM.ico"          window / app icon
+     IDB_ADD   BITMAP "Add.bmp" ... IDB_INFO2 "Info2.bmp"  (14 toolbar bmps)
+     7zipLogo.ico                       About-dialog logo
+
+  The alias is the basename so FmIcons.cpp can look them up as
+  ":/fm/Add.bmp", ":/fm/FM.ico", etc.
+
+  The magenta (RGB 255,0,255) transparency that App.cpp's
+  imageList.AddMasked(bmp, RGB(255,0,255)) applies is reproduced at load time
+  in FmIcons::toolbarIcon(); the bitmaps are stored here verbatim.
+-->
+<RCC>
+  <qresource prefix="/fm">
+    <!-- Window / app icon and About logo (resource.rc IDI_ICON / 7zipLogo). -->
+    <file alias="FM.ico">../../FileManager/FM.ico</file>
+    <file alias="7zipLogo.ico">../../FileManager/7zipLogo.ico</file>
+
+    <!-- The 14 toolbar bitmaps: LARGE (48x36) X.bmp + SMALL (24x24) X2.bmp,
+         one pair per button, exactly the resource.rc IDB_* -> *.bmp mapping. -->
+    <file alias="Add.bmp">../../FileManager/Add.bmp</file>
+    <file alias="Add2.bmp">../../FileManager/Add2.bmp</file>
+    <file alias="Extract.bmp">../../FileManager/Extract.bmp</file>
+    <file alias="Extract2.bmp">../../FileManager/Extract2.bmp</file>
+    <file alias="Test.bmp">../../FileManager/Test.bmp</file>
+    <file alias="Test2.bmp">../../FileManager/Test2.bmp</file>
+    <file alias="Copy.bmp">../../FileManager/Copy.bmp</file>
+    <file alias="Copy2.bmp">../../FileManager/Copy2.bmp</file>
+    <file alias="Move.bmp">../../FileManager/Move.bmp</file>
+    <file alias="Move2.bmp">../../FileManager/Move2.bmp</file>
+    <file alias="Delete.bmp">../../FileManager/Delete.bmp</file>
+    <file alias="Delete2.bmp">../../FileManager/Delete2.bmp</file>
+    <file alias="Info.bmp">../../FileManager/Info.bmp</file>
+    <file alias="Info2.bmp">../../FileManager/Info2.bmp</file>
+  </qresource>
+
+  <!-- B.6 : the ORIGINAL per-format archive icons, embedded BY IN-TREE PATH
+       from CPP/7zip/Archive/Icons/ (the same .ico Format7zF/resource.rc binds
+       by id). Aliased to basename so FormatIcons can load ":/fm/fmt/<x>.ico".
+       Distinct /fm/fmt prefix so these cannot collide with the /fm toolbar
+       aliases above. NOTHING is copied: the paths point straight at the stock
+       assets (relative ../../../Archive/Icons/ from this .qrc in UI/Qt/fm/). -->
+  <qresource prefix="/fm/fmt">
+    <file alias="7z.ico">../../../Archive/Icons/7z.ico</file>
+    <file alias="apfs.ico">../../../Archive/Icons/apfs.ico</file>
+    <file alias="arj.ico">../../../Archive/Icons/arj.ico</file>
+    <file alias="bz2.ico">../../../Archive/Icons/bz2.ico</file>
+    <file alias="cab.ico">../../../Archive/Icons/cab.ico</file>
+    <file alias="cpio.ico">../../../Archive/Icons/cpio.ico</file>
+    <file alias="deb.ico">../../../Archive/Icons/deb.ico</file>
+    <file alias="dmg.ico">../../../Archive/Icons/dmg.ico</file>
+    <file alias="fat.ico">../../../Archive/Icons/fat.ico</file>
+    <file alias="gz.ico">../../../Archive/Icons/gz.ico</file>
+    <file alias="hfs.ico">../../../Archive/Icons/hfs.ico</file>
+    <file alias="iso.ico">../../../Archive/Icons/iso.ico</file>
+    <file alias="lzh.ico">../../../Archive/Icons/lzh.ico</file>
+    <file alias="lzma.ico">../../../Archive/Icons/lzma.ico</file>
+    <file alias="ntfs.ico">../../../Archive/Icons/ntfs.ico</file>
+    <file alias="rar.ico">../../../Archive/Icons/rar.ico</file>
+    <file alias="rpm.ico">../../../Archive/Icons/rpm.ico</file>
+    <file alias="split.ico">../../../Archive/Icons/split.ico</file>
+    <file alias="squashfs.ico">../../../Archive/Icons/squashfs.ico</file>
+    <file alias="tar.ico">../../../Archive/Icons/tar.ico</file>
+    <file alias="vhd.ico">../../../Archive/Icons/vhd.ico</file>
+    <file alias="wim.ico">../../../Archive/Icons/wim.ico</file>
+    <file alias="xar.ico">../../../Archive/Icons/xar.ico</file>
+    <file alias="xz.ico">../../../Archive/Icons/xz.ico</file>
+    <file alias="z.ico">../../../Archive/Icons/z.ico</file>
+    <file alias="zip.ico">../../../Archive/Icons/zip.ico</file>
+    <file alias="zst.ico">../../../Archive/Icons/zst.ico</file>
+  </qresource>
+</RCC>

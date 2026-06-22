@@ -206,6 +206,16 @@ struct CCopyStateIO
 
 HRESULT SendLastErrorMessage(IFolderOperationsExtractCallback *callback, const FString &fileName);
 
+#ifndef _WIN32
+// [B.4 Linux port] NDir::RemoveDirWithSubItems (recursive directory removal) is
+// declared/defined only under `#ifdef _WIN32` in Windows/FileDir.{h,cpp}. The FS
+// Delete operation (CFSFolder::Delete on a folder) needs it on Linux. This is the
+// faithful POSIX equivalent (two-phase readdir enumerate + recurse + unlink +
+// rmdir), defined in FSFolderCopy.cpp (the FS write-path TU). Used by
+// CFSFolder::Delete (FSFolder.cpp). Returns true on full removal.
+bool RemoveDirWithSubItems_Fs(const FString &path);
+#endif
+
 /* destDirPrefix is allowed to be:
    "full_path\" or "full_path:" for alt streams */
 

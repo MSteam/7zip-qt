@@ -2,6 +2,12 @@
 
 #include "StdAfx.h"
 
+// [B.2 Linux port] <winternl.h> / <ddk/ntddk.h> are Win32 SDK headers (NTSTATUS,
+// IO_STATUS_BLOCK for the NtQueryInformationFile change-time query below). They
+// do not exist on Linux; the whole NT-query path is itself _WIN32-guarded later,
+// so on Linux this entire block is skipped. Windows branch is verbatim-original.
+#ifdef _WIN32
+
 #ifdef __MINGW32_VERSION
 // #if !defined(_MSC_VER) && (__GNUC__) && (__GNUC__ < 10)
 // for old mingw
@@ -23,6 +29,8 @@ typedef struct _IO_STATUS_BLOCK {
 #endif
 #endif
 
+#endif // _WIN32
+
 #include "../../../Common/ComTry.h"
 #include "../../../Common/Defs.h"
 #include "../../../Common/StringConvert.h"
@@ -36,14 +44,21 @@ typedef struct _IO_STATUS_BLOCK {
 
 #include "../../PropID.h"
 
-#include "FSDrives.h"
 #include "FSFolder.h"
 
+// [B.2 Linux port] FSDrives.h (CFSDrives), NetFolder.h (CNetFolder ->
+// Windows/Net.h) and SysIconUtils.h (-> <CommCtrl.h>, the Win32 common-controls
+// GUI header) are Win32-GUI-coupled File-Manager units. FSFolder only references
+// them on Windows-specific code paths (drive-root parent folder, shell icon
+// index) that are themselves _WIN32-guarded below, so on Linux they are not
+// needed and not compiled. Windows branch is verbatim-original.
+#ifdef _WIN32
+#include "FSDrives.h"
 #ifndef UNDER_CE
 #include "NetFolder.h"
 #endif
-
 #include "SysIconUtils.h"
+#endif
 
 #if !defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0501
 #ifdef _APISETFILE_
@@ -141,6 +156,7 @@ HRESULT CFsFolderStat::Enumerate()
   const unsigned len = Path.Len();
   CEnumerator enumerator;
   enumerator.SetDirPrefix(Path);
+#ifdef _WIN32
   CDirEntry fi;
   while (enumerator.Next(fi))
   {
@@ -157,11 +173,48 @@ HRESULT CFsFolderStat::Enumerate()
       Size += fi.Size;
     }
   }
+#else
+  // [B.2 Linux port] The Win32 CEnumerator yields a full CFileInfo (CDirEntry is
+  // typedef'd to CFileInfo) directly from Next(). The Linux CEnumerator is a thin
+  // readdir() wrapper: Next(CDirEntry&, bool&) yields only {name, d_type}, and a
+  // full CFileInfo (size, IsDir) must be resolved per-entry via Fill_FileInfo()
+  // (lstat). This is exactly the two-phase pattern the engine's own portable
+  // CDirItems::EnumerateOneDir uses (UI/Common/EnumDirItems.cpp). The Windows
+  // branch (#if) is verbatim-original.
+  for (;;)
+  {
+    bool found;
+    CDirEntry de;
+    if (!enumerator.Next(de, found))
+      break;
+    if (!found)
+      break;
+    CFileInfo fi;
+    if (!enumerator.Fill_FileInfo(de, fi, true /* followLink: count real file sizes */))
+      continue;
+    if (fi.IsDir())
+    {
+      NumFolders++;
+      Path.DeleteFrom(len);
+      Path += de.Name;
+      RINOK(Enumerate())
+    }
+    else
+    {
+      NumFiles++;
+      Size += fi.Size;
+    }
+  }
+#endif
   return S_OK;
 }
 
-#ifndef UNDER_CE
+#if !defined(UNDER_CE) && defined(_WIN32)
 
+// [B.2 Linux port] MyGetCompressedFileSizeW wraps the Win32 GetCompressedFileSizeW
+// (NTFS compressed/sparse on-disk size). There is no portable equivalent; on
+// Linux the only caller (GetProperty kpidPackSize) is _WIN32-guarded too and
+// falls back to fi.Size. Windows branch is verbatim-original.
 bool MyGetCompressedFileSizeW(CFSTR path, UInt64 &size);
 bool MyGetCompressedFileSizeW(CFSTR path, UInt64 &size)
 {
@@ -207,9 +260,37 @@ HRESULT CFSFolder::LoadSubItems(int dirItem, const FString &relPrefix)
     fi.NumFolders = 0;
     fi.NumFiles = 0;
     fi.Parent = dirItem;
-    
+
+#ifndef _WIN32
+    // [B.2 Linux port] The Win32 CEnumerator::Next(fi) fills a full CFileInfo
+    // (CDirItem's base) per call. The Linux CEnumerator is a readdir() wrapper
+    // that yields a lightweight CDirEntry; the full CFileInfo (size, times,
+    // mode/IsDir, inode, nlink) is resolved per-entry via Fill_FileInfo() (lstat).
+    // We first collect all CDirEntry's, then in the loop below Fill_FileInfo each
+    // into the CDirItem base before running the SHARED per-item body. This is the
+    // same two-phase pattern as the engine's CDirItems::EnumerateOneDir
+    // (UI/Common/EnumDirItems.cpp). The Win32 loop header (#else) is verbatim.
+    CObjectVector<CDirEntry> _entries;
+    for (;;)
+    {
+      bool found;
+      CDirEntry de;
+      if (!enumerator.Next(de, found) || !found)
+        break;
+      _entries.Add(de);
+    }
+    FOR_VECTOR (_ei, _entries)
+    {
+      const CDirEntry &de = _entries[_ei];
+      // Fill the CFileInfo base of fi; followLink=false so a symlink is reported
+      // as itself (matches the Windows listing, which does not follow links here).
+      if (!enumerator.Fill_FileInfo(de, fi, false))
+        continue;
+      fi.Name = de.Name;
+#else
     while (enumerator.Next(fi))
     {
+#endif
       if (fi.IsDir())
       {
         fi.Size = 0;
@@ -242,6 +323,13 @@ HRESULT CFSFolder::LoadSubItems(int dirItem, const FString &relPrefix)
       fi.PackSize = fi.Size;
      
      #ifdef FS_SHOW_LINKS_INFO
+     #ifdef _WIN32
+      // [B.2 Linux port] CFileInfoBase::HasReparsePoint() and the 3-arg
+      // NIO::GetReparseData(path, buf, BY_HANDLE_FILE_INFORMATION*) (NTFS reparse
+      // points + by-handle file info) are _WIN32-only. On Linux there are no NTFS
+      // reparse points and CDirItem::Reparse stays empty (set above by .Free()),
+      // so the GetRawProp(kpidNtReparse) path returns nothing - matching how a
+      // non-reparse item behaves on Windows. Windows branch is verbatim-original.
       if (fi.HasReparsePoint())
       {
         fi.FileInfo_WasRequested = true;
@@ -251,6 +339,7 @@ HRESULT CFSFolder::LoadSubItems(int dirItem, const FString &relPrefix)
         fi.FileIndex = (((UInt64)info.nFileIndexHigh) << 32) + info.nFileIndexLow;
         fi.FileInfo_Defined = true;
       }
+     #endif
      #endif
 
      #endif // UNDER_CE
@@ -350,6 +439,7 @@ bool CFSFolder::SaveComments()
     utf.Insert(0, "\xEF\xBB\xBF" "\r\n");
 
   FString path = _path + kDescriptionFileName;
+ #ifdef _WIN32
   // We must set same attrib. COutFile::CreateAlways can fail, if file has another attrib.
   DWORD attrib = FILE_ATTRIBUTE_NORMAL;
   {
@@ -362,6 +452,18 @@ bool CFSFolder::SaveComments()
     return false;
   UInt32 processed;
   file.Write(utf, utf.Len(), processed);
+ #else
+  // [B.2 Linux port] CFileInfoBase::Attrib, COutFile::Create_ALWAYS_with_Attribs
+  // and COutFile::Write are _WIN32-only. The "preserve the file attribute" step
+  // is a Windows-attrib concern with no Linux equivalent; on Linux we just
+  // (re)create the descript.ion file and write it with the portable WriteFull.
+  // (SaveComments is a write/SetProperty path, not exercised by B.2 browsing.)
+  NIO::COutFile file;
+  if (!file.Create_ALWAYS(path))
+    return false;
+  if (!file.WriteFull(utf, utf.Len()))
+    return false;
+ #endif
   _commentsAreLoaded = false;
   return true;
 }
@@ -428,7 +530,19 @@ Z7_COM7F_IMF2(UInt64, CFSFolder::GetItemSize(UInt32 index))
 #endif
 
 
-#ifdef FS_SHOW_LINKS_INFO
+// [B.2 Linux port] The link/inode/change-time helpers below
+// (CFSFolder::ReadFileInfo, CFSFolder::ReadChangeTime) and their NT typedef
+// block are all _WIN32-only:
+//   * ReadFileInfo uses NIO::CFileBase::GetFileInformation +
+//     BY_HANDLE_FILE_INFORMATION (the Win32 by-handle file info: hard-link count
+//     and 64-bit file index/inode).
+//   * ReadChangeTime dynamically binds NtQueryInformationFile from ntdll.dll to
+//     read the NTFS "change time" - a Windows-kernel API with no Linux analog.
+// On Linux these are not compiled; the kpidLinks / kpidINode / kpidChangeTime
+// property reads that would call them are likewise _WIN32-guarded at their call
+// sites (GetProperty / CompareItems), so those props simply stay empty/undefined
+// - exactly as on Windows when the queries fail. Windows branch is verbatim.
+#if defined(FS_SHOW_LINKS_INFO) && defined(_WIN32)
 
 bool CFSFolder::ReadFileInfo(CDirItem &di)
 {
@@ -576,7 +690,10 @@ Z7_COM7F_IMF(CFSFolder::GetProperty(UInt32 index, PROPID propID, PROPVARIANT *va
     case kpidName: prop = fs2us(fi.Name); break;
     case kpidSize: if (!fi.IsDir() || fi.FolderStat_Defined) prop = fi.Size; break;
     case kpidPackSize:
-      #ifdef UNDER_CE
+      #if defined(UNDER_CE) || !defined(_WIN32)
+      // [B.2 Linux port] no GetCompressedFileSizeW (NTFS on-disk compressed size)
+      // on Linux; pack size == logical size, the same fallback Windows uses when
+      // the query fails. Windows branch (#else) is verbatim-original.
       prop = fi.Size;
       #else
       if (!fi.PackSize_Defined)
@@ -594,6 +711,11 @@ Z7_COM7F_IMF(CFSFolder::GetProperty(UInt32 index, PROPID propID, PROPVARIANT *va
     case kpidLinks:
       #ifdef UNDER_CE
       // prop = fi.NumLinks;
+      #elif !defined(_WIN32)
+      // [B.2 Linux port] ReadFileInfo (Win32 by-handle file info) is not built;
+      // the portable CFileInfo already carries the POSIX hard-link count (nlink)
+      // from the lstat/stat-based scan, so report it directly.
+      prop = (UInt32)fi.nlink;
       #else
       if (!fi.FileInfo_WasRequested)
         ReadFileInfo(fi);
@@ -601,10 +723,14 @@ Z7_COM7F_IMF(CFSFolder::GetProperty(UInt32 index, PROPID propID, PROPVARIANT *va
         prop = fi.NumLinks;
       #endif
       break;
-    
+
     case kpidINode:
       #ifdef UNDER_CE
       // prop = fi.FileIndex;
+      #elif !defined(_WIN32)
+      // [B.2 Linux port] same as kpidLinks: use the POSIX inode number (ino)
+      // already present on CFileInfo instead of the Win32 64-bit file index.
+      prop = (UInt64)fi.ino;
       #else
       if (!fi.FileInfo_WasRequested)
         ReadFileInfo(fi);
@@ -614,18 +740,42 @@ Z7_COM7F_IMF(CFSFolder::GetProperty(UInt32 index, PROPID propID, PROPVARIANT *va
       break;
 
     case kpidChangeTime:
+      #ifdef _WIN32
       if (!fi.ChangeTime_WasRequested)
         ReadChangeTime(fi);
       if (fi.ChangeTime_Defined)
         prop = fi.ChangeTime;
+      #else
+      // [B.2 Linux port] the NTFS "change time" (ReadChangeTime via ntdll
+      // NtQueryInformationFile) has no portable equivalent; leave undefined, as
+      // Windows does when the NT query fails. Windows branch is verbatim.
+      #endif
       break;
-      
+
     #endif
 
+    // [B.2 Linux port] CFileInfoBase::Attrib is _WIN32-only; GetWinAttrib() maps
+    // the POSIX mode to the same Windows attribute bitmask kpidAttrib expects
+    // (identical value on Windows). Same accessor the Agent.cpp B.0 port uses.
+    #ifdef _WIN32
     case kpidAttrib: prop = (UInt32)fi.Attrib; break;
+    #else
+    case kpidAttrib: prop = (UInt32)fi.GetWinAttrib(); break;
+    #endif
+    // [B.2 Linux port] On Windows CFiTime IS a FILETIME, so the verbatim
+    // `prop = fi.CTime` uses CPropVariant's FILETIME assignment. On Linux CFiTime
+    // is a `timespec`; the engine's portable helper PropVariant_SetFrom_FiTime
+    // converts it to the same NTFS-time PROPVARIANT the view formats (so the
+    // displayed time matches a Windows listing). Windows branch is verbatim.
+    #ifdef _WIN32
     case kpidCTime: prop = fi.CTime; break;
     case kpidATime: prop = fi.ATime; break;
     case kpidMTime: prop = fi.MTime; break;
+    #else
+    case kpidCTime: PropVariant_SetFrom_FiTime(prop, fi.CTime); break;
+    case kpidATime: PropVariant_SetFrom_FiTime(prop, fi.ATime); break;
+    case kpidMTime: PropVariant_SetFrom_FiTime(prop, fi.MTime); break;
+    #endif
     case kpidComment:
     {
       if (!_commentsAreLoaded)
@@ -742,10 +892,20 @@ Z7_COM7F_IMF2(Int32, CFSFolder::CompareItems(UInt32 index1, UInt32 index2, PROPI
       return MyCompare(
           /* ss1 ? ss1->Size : */ fi1.Size,
           /* ss2 ? ss2->Size : */ fi2.Size);
+    // [B.2 Linux port] CFileInfoBase::Attrib is _WIN32-only; compare the mapped
+    // GetWinAttrib() value (identical to Attrib on Windows). Same idiom as above.
+    #ifdef _WIN32
     case kpidAttrib: return MyCompare(fi1.Attrib, fi2.Attrib);
-    case kpidCTime: return CompareFileTime(&fi1.CTime, &fi2.CTime);
-    case kpidATime: return CompareFileTime(&fi1.ATime, &fi2.ATime);
-    case kpidMTime: return CompareFileTime(&fi1.MTime, &fi2.MTime);
+    #else
+    case kpidAttrib: return MyCompare(fi1.GetWinAttrib(), fi2.GetWinAttrib());
+    #endif
+    // [B.2 Linux port] On Windows CFiTime is FILETIME, so the verbatim
+    // ::CompareFileTime applies. On Linux CFiTime is a timespec; the engine's
+    // portable Compare_FiTime (a macro for ::CompareFileTime on Windows, a real
+    // function on Linux - Windows/TimeUtils.h) compares them. Same ordering.
+    case kpidCTime: return Compare_FiTime(&fi1.CTime, &fi2.CTime);
+    case kpidATime: return Compare_FiTime(&fi1.ATime, &fi2.ATime);
+    case kpidMTime: return Compare_FiTime(&fi1.MTime, &fi2.MTime);
     case kpidIsDir:
     {
       const bool isDir1 = /* ss1 ? false : */ fi1.IsDir();
@@ -769,7 +929,12 @@ Z7_COM7F_IMF2(Int32, CFSFolder::CompareItems(UInt32 index1, UInt32 index2, PROPI
     #ifdef FS_SHOW_LINKS_INFO
     case kpidINode:
     {
-      #ifndef UNDER_CE
+      #if defined(UNDER_CE)
+      #elif !defined(_WIN32)
+      // [B.2 Linux port] compare the POSIX inode numbers directly (ReadFileInfo
+      // is Win32-only); see the GetProperty kpidINode note.
+      return MyCompare(fi1.ino, fi2.ino);
+      #else
       if (!fi1.FileInfo_WasRequested) ReadFileInfo(fi1);
       if (!fi2.FileInfo_WasRequested) ReadFileInfo(fi2);
       return MyCompare(
@@ -779,7 +944,11 @@ Z7_COM7F_IMF2(Int32, CFSFolder::CompareItems(UInt32 index1, UInt32 index2, PROPI
     }
     case kpidLinks:
     {
-      #ifndef UNDER_CE
+      #if defined(UNDER_CE)
+      #elif !defined(_WIN32)
+      // [B.2 Linux port] compare the POSIX hard-link counts directly.
+      return MyCompare(fi1.nlink, fi2.nlink);
+      #else
       if (!fi1.FileInfo_WasRequested) ReadFileInfo(fi1);
       if (!fi2.FileInfo_WasRequested) ReadFileInfo(fi2);
       return MyCompare(
@@ -896,8 +1065,44 @@ Z7_COM7F_IMF(CFSFolder::BindToParentFolder(IFolderFolder **resultFolder))
   */
   if (_path.IsEmpty())
     return E_INVALIDARG;
-  
-  #ifndef UNDER_CE
+
+  #if defined(UNDER_CE)
+
+  #elif !defined(_WIN32)
+
+  // [B.2 Linux port] The Windows branch (#else) handles drive letters: a drive
+  // ROOT ("C:\") binds up to the CFSDrives "Computer" folder, and a drive PATH
+  // binds up to its parent directory. Linux has a single unified tree rooted at
+  // "/", with no drive-letter concept, so CFSDrives / IsDriveRootPath_SuperAllowed
+  // / IsDrivePath_SuperAllowed / IsSuperPath (all _WIN32-only) do not apply. We
+  // implement the faithful POSIX equivalent of "go up one directory":
+  //   _path always ends in a separator (BindToFolderSpec / Init append one).
+  //   * at the filesystem root "/" there is no parent -> return NULL folder
+  //     (QtFolderModel::goParent treats a NULL parent as "already at top"),
+  //   * otherwise strip the trailing separator and everything after the previous
+  //     separator, then Init a new CFSFolder rooted at that parent prefix.
+  {
+    // strip the trailing separator
+    int pos = _path.ReverseFind_PathSepar();
+    if (pos != (int)_path.Len() - 1)
+      return E_FAIL;
+    if (pos <= 0)
+      return S_OK; // _path == "/" : the root has no parent
+    FString parentPath = _path.Left((unsigned)pos);
+    pos = parentPath.ReverseFind_PathSepar();
+    // keep the separator so the parent prefix also ends in one (root stays "/")
+    parentPath.DeleteFrom((unsigned)(pos + 1));
+
+    CFSFolder *parentFolderSpec = new CFSFolder;
+    CMyComPtr<IFolderFolder> parentFolder = parentFolderSpec;
+    if (parentFolderSpec->Init(parentPath) == S_OK)
+    {
+      *resultFolder = parentFolder.Detach();
+      return S_OK;
+    }
+  }
+
+  #else
 
   if (IsDriveRootPath_SuperAllowed(_path))
   {
@@ -907,7 +1112,7 @@ Z7_COM7F_IMF(CFSFolder::BindToParentFolder(IFolderFolder **resultFolder))
     *resultFolder = drivesFolder.Detach();
     return S_OK;
   }
-  
+
   int pos = _path.ReverseFind_PathSepar();
   if (pos < 0 || pos != (int)_path.Len() - 1)
     return E_FAIL;
@@ -925,10 +1130,10 @@ Z7_COM7F_IMF(CFSFolder::BindToParentFolder(IFolderFolder **resultFolder))
       return S_OK;
     }
   }
-  
+
   /*
   FString parentPathReduced = parentPath.Left(pos);
-  
+
   pos = parentPathReduced.ReverseFind_PathSepar();
   if (pos == 1)
   {
@@ -941,7 +1146,7 @@ Z7_COM7F_IMF(CFSFolder::BindToParentFolder(IFolderFolder **resultFolder))
     return S_OK;
   }
   */
-  
+
   #endif
 
   return S_OK;
@@ -1121,7 +1326,18 @@ Z7_COM7F_IMF(CFSFolder::Delete(const UInt32 *indices, UInt32 numItems,IProgress 
       const FString fullPath = _path + GetRelPath(fi);
       // prevDeletedFileIndex = index;
       if (fi.IsDir())
+       #ifdef _WIN32
         result = RemoveDirWithSubItems(fullPath);
+       #else
+        // [B.4 Linux port] NDir::RemoveDirWithSubItems (recursive directory
+        // removal) is _WIN32-only in the engine (Windows/FileDir.cpp builds it
+        // inside #ifdef _WIN32; it uses the Win32 CEnumerator::Next(fi) +
+        // HasReparsePoint). B.4a supplies the faithful POSIX equivalent
+        // RemoveDirWithSubItems_Fs (NFsFolder, defined in FSFolderCopy.cpp): same
+        // logic (enumerate + recurse + unlink + rmdir) using the two-phase Linux
+        // CEnumerator. The plain-file branch below stays portable (DeleteFileAlways).
+        result = NFsFolder::RemoveDirWithSubItems_Fs(fullPath);
+       #endif
       else
         result = DeleteFileAlways(fullPath);
     }
@@ -1177,9 +1393,19 @@ Z7_COM7F_IMF(CFSFolder::GetSystemIconIndex(UInt32 index, Int32 *iconIndex))
   *iconIndex = -1;
   if (index >= Files.Size())
     return E_INVALIDARG;
+  #ifdef _WIN32
   const CDirItem &fi = Files[index];
   return Shell_GetFileInfo_SysIconIndex_for_Path_return_HRESULT(
       _path + GetRelPath(fi), fi.Attrib, iconIndex);
+  #else
+  // [B.2 Linux port] Shell_GetFileInfo_SysIconIndex_* lives in SysIconUtils.cpp,
+  // which is a Win32 Shell/common-controls (HIMAGELIST / SHGetFileInfo) unit not
+  // built on Linux. The Qt model provides its own theme icons (QIcon::fromTheme),
+  // so this engine-side system-image-list index is unused; report "no index"
+  // (-1), which is exactly what the Windows path yields when the shell lookup
+  // fails. Windows branch (#if) is verbatim-original.
+  return S_OK;
+  #endif
 }
 
 Z7_COM7F_IMF(CFSFolder::SetFlatMode(Int32 flatMode))

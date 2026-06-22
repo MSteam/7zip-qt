@@ -43,7 +43,13 @@ static bool Delete_EmptyFolder_And_EmptySubFolders(const FString &path)
           return false;
         if (!found)
           break;
+#ifdef _WIN32
         if (fileInfo.IsDir())
+#else
+        // [B.5 Linux port] POSIX CDirEntry has no IsDir() (Windows/FileFind.h);
+        // use the enumerator's portable directory test (no symlink follow).
+        if (enumerator.DirEntry_IsDir(fileInfo, false))
+#endif
           names.Add(fileInfo.Name);
       }
     }
@@ -56,9 +62,15 @@ static bool Delete_EmptyFolder_And_EmptySubFolders(const FString &path)
     if (!res)
       return false;
   }
+#ifdef _WIN32
   // we clear read-only attrib to remove read-only dir
   if (!SetFileAttrib(path, 0))
     return false;
+#endif
+  // [B.5 Linux port] the bare SetFileAttrib symbol is _WIN32-only (POSIX exposes
+  // only SetFileAttrib_PosixHighDetect); and on POSIX rmdir() is gated by the
+  // PARENT directory's permissions, not the target's own mode, so the read-only
+  // clear is unnecessary here.
   return RemoveDir(path);
 }
 

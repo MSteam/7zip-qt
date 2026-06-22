@@ -225,11 +225,19 @@ Z7_COM7F_IMF(CAgent::DoOperation(
 
   {
     FString folderPrefix = _folderPrefix;
+#ifdef _WIN32
     if (!NFile::NName::IsAltStreamPrefixWithColon(fs2us(folderPrefix)))
       NFile::NName::NormalizeDirPathPrefix(folderPrefix);
+#else
+    // [B.5 Linux port] IsAltStreamPrefixWithColon is _WIN32-only (NTFS
+    // "name:stream" detection); POSIX has no alt-stream colon prefix, so the
+    // prefix is always normalized.
+    NFile::NName::NormalizeDirPathPrefix(folderPrefix);
+#endif
     
     RINOK(dirItems.EnumerateItems2(folderPrefix, _updatePathPrefix, _names, requestedPaths))
 
+#ifdef _WIN32
     if (_updatePathPrefix_is_AltFolder)
     {
       FOR_VECTOR(i, dirItems.Items)
@@ -240,6 +248,17 @@ Z7_COM7F_IMF(CAgent::DoOperation(
         item.IsAltStream = true;
       }
     }
+#else
+    // [B.5 Linux port] On Windows, adding into an archive's NTFS alt-stream
+    // folder marks each new item as an alt stream. CDirItem has no IsAltStream
+    // member on POSIX, so we cannot represent that - proceeding would emit
+    // malformed regular files whose in-archive path carries the ':' alt-stream
+    // separator. Reject instead, mirroring the Windows intent (such items ARE
+    // alt-streams, not plain files). NOTE: _updatePathPrefix_is_AltFolder CAN be
+    // true here for a 7z that contains alt streams (CProxyArc2, AgentProxy.cpp).
+    if (_updatePathPrefix_is_AltFolder)
+      return E_NOTIMPL;
+#endif
   }
 
   CMyComPtr<IOutArchive> outArchive;
@@ -507,7 +526,14 @@ HRESULT CAgent::CreateFolder(ISequentialOutStream *outArchiveStream,
 
   CDirItem di;
 
+#ifdef _WIN32
   di.Attrib = FILE_ATTRIBUTE_DIRECTORY;
+#else
+  // [B.5 Linux port] CFileInfoBase::Attrib is _WIN32-only; SetAsDir() sets the
+  // POSIX directory marker (mode = S_IFDIR | 0777) - the engine's own portable
+  // equivalent (Windows/FileFind.h; used by EnumDirItems.cpp).
+  di.SetAsDir();
+#endif
   di.Size = 0;
   bool isAltStreamFolder = false;
   if (_proxy2)
@@ -516,9 +542,17 @@ HRESULT CAgent::CreateFolder(ISequentialOutStream *outArchiveStream,
     di.Name = _proxy->GetDirPath_as_Prefix(_agentFolder->_proxyDirIndex);
   di.Name += folderName;
 
+#ifdef _WIN32
   FILETIME ft;
   NTime::GetCurUtcFileTime(ft);
   di.CTime = di.ATime = di.MTime = ft;
+#else
+  // [B.5 Linux port] CDirItem's C/A/M times are CFiTime (timespec) here, not
+  // FILETIME, and GetCurUtcFileTime maps to GetCurUtc_FiTime(CFiTime&) on Linux
+  // (Windows/TimeUtils.h). Mirror CFileInfoBase::SetAs_StdInFile.
+  NTime::GetCurUtc_FiTime(di.MTime);
+  di.CTime = di.ATime = di.MTime;
+#endif
 
   dirItems.Items.Add(di);
 
